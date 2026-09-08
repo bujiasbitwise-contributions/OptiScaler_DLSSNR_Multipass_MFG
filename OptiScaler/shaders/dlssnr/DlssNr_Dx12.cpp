@@ -394,6 +394,11 @@ std::unique_ptr<GpuTime_Dx12> g_ngxTime;
 std::optional<double> g_lastNgxTime;
 std::optional<double> g_lastGpuTime;
 
+// Diagnostic build only: exercise the complete NR model path but do not write its result into the
+// game-owned output that native frame generation consumes.
+constexpr bool kDiagnosticSkipResolveToGameOutput = true;
+bool g_diagnosticResolveSkipLogged = false;
+
 // Writes matched before/after frames on request, so comparisons stop depending on video.
 capture::FrameCapture g_capture;
 
@@ -2839,25 +2844,38 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
                      composeNow.workH, composeNow.passes, composeNow.debugView, composeNow.compareMode);
         }
 
-        setWork(answer, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        DispatchPass(cmdList, resolveParams, modelInput, work[answer], g_nr.hdrCopy, motionIn,
-                            nullptr, target, nullptr);
-        setWork(answer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-
-        g_nr.wroteTarget = true;
-
-        // On-demand capture works in this path too: the staging copy still holds the frame as the
-        // upscaler produced it, and the edited frame is the output itself. The write happens a few
-        // frames later, once the GPU is certainly past these copies -- this path has no fence of its
-        // own.
-        if (g_capture.isActive())
+        if (kDiagnosticSkipResolveToGameOutput)
         {
-            g_capture.record(cmdList, device, g_nr.colorCopy,
-                             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, target,
-                             D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            if (!g_diagnosticResolveSkipLogged)
+            {
+                g_diagnosticResolveSkipLogged = true;
+                LOG_INFO("DLSS-NR diagnostic: model evaluated successfully; Resolve into game output is disabled");
+            }
+            // work[answer] remains in UNORDERED_ACCESS, as required by the normal cleanup below.
+            // The game's target is deliberately untouched; g_nr.wroteTarget remains false.
+        }
+        else
+        {
+            setWork(answer, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            DispatchPass(cmdList, resolveParams, modelInput, work[answer], g_nr.hdrCopy, motionIn,
+                         nullptr, target, nullptr);
+            setWork(answer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
-            if (g_capture.readyToWrite() && g_captureWriteAtFrame == 0)
-                g_captureWriteAtFrame = g_frames + 8;
+            g_nr.wroteTarget = true;
+
+            // On-demand capture works in this path too: the staging copy still holds the frame as the
+            // upscaler produced it, and the edited frame is the output itself. The write happens a few
+            // frames later, once the GPU is certainly past these copies -- this path has no fence of its
+            // own.
+            if (g_capture.isActive())
+            {
+                g_capture.record(cmdList, device, g_nr.colorCopy,
+                                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, target,
+                                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+                if (g_capture.readyToWrite() && g_captureWriteAtFrame == 0)
+                    g_captureWriteAtFrame = g_frames + 8;
+            }
         }
     }
     else
